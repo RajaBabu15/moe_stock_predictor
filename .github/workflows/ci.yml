@@ -1,0 +1,42 @@
+# .github/workflows/ci.yml
+name: Python CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"] # Test against multiple Python versions
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        # Install ta-lib dependencies (example for Ubuntu)
+        sudo apt-get update
+        sudo apt-get install -y build-essential libta-lib-dev # Might need other deps depending on OS
+
+    - name: Install TA-Lib Python wrapper
+      run: |
+        pip install TA-Lib # Install the Python wrapper after system deps are ready
+
+    - name: Lint with flake8 (Optional)
+      run: |
+        pip install flake8
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Test with pytest
+      run: |
+        pip install pytest
+        pytest tests/ # Run tests in the tests directory

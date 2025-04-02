@@ -1,0 +1,29 @@
+name: moe_stock_env
+channels:
+  - conda-forge # Recommended channel for many packages
+  - defaults
+dependencies:
+  - python=3.10 # Specify Python version
+  - pip
+  # Core ML/Data Science
+  - tensorflow>=2.12 # Or specify a CUDA version like tensorflow=2.12.*=*cuda*
+  - pandas
+  - numpy
+  - scikit-learn
+  - matplotlib
+  # TA-Lib (requires system dependencies first - see README)
+  - ta-lib # The underlying C library
+  # Model Enhancements & Deployment
+  - tensorflow-model-optimization
+  - keras-tuner
+  - onnx
+  - tf2onnx # Usually installed via pip is fine too
+  - joblib # For saving scalers
+  # Visualization/App
+  - gradio
+  # Testing
+  - pytest
+  # Pip dependencies (for packages not easily available on conda-forge/defaults)
+  - pip:
+    - TA-Lib # The Python wrapper for ta-lib C library
+    # Add any other pip-only dependencies here
