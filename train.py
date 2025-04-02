@@ -3,8 +3,10 @@ import tensorflow as tf
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard
 import os
 import time
+import datetime
 import matplotlib.pyplot as plt
 import numpy as np
+import joblib
 
 # Import project modules
 from config.config import CONFIG
@@ -14,6 +16,7 @@ from moe_model.preprocessing import scale_and_sequence_data, create_tf_dataset
 from moe_model.model_builder import build_moe_model
 from moe_model.uncertainty import ProbabilisticMoE
 from moe_model.components import GateWeightLogger # Import custom callback
+from moe_model.transformer_expert import TransformerExpert
 from utils.plotting import plot_training_history, plot_predictions
 from utils.metrics import calculate_financial_metrics
 from utils.export import export_to_onnx
@@ -24,9 +27,16 @@ def train_and_evaluate(config):
     try:
         df, target_col_name = load_and_prepare_data(config)
         df_featured = apply_feature_engineering(df, config)
-        X_train, y_train, X_test, y_test, scaler_target, num_features, _ = scale_and_sequence_data(
+        X_train, y_train, X_test, y_test, scaler_target, num_features, scaler_features = scale_and_sequence_data(
             df_featured, target_col_name, config
         )
+        
+        # Save scalers immediately after creation
+        print("Saving scalers...")
+        joblib.dump(scaler_features, 'scaler_features.joblib')
+        joblib.dump(scaler_target, 'scaler_target.joblib')
+        print("Scalers saved successfully.")
+        
     except Exception as e:
         print(f"Fatal Error during data processing: {e}"); return None, None
     if X_train.shape[0] < config["batch_size"] or X_test.shape[0] == 0:
@@ -125,37 +135,59 @@ def train_and_evaluate(config):
     test_mae_scaled = results[base_model.metrics_names.index('mae')] if 'mae' in base_model.metrics_names else float('nan')
 
     print("\n--- 6. Predictions & Uncertainty ---")
-    y_test_unscaled = scaler_target.inverse_transform(y_test.reshape(-1, 1).astype(np.float32))
-
-    if config["predict_uncertainty"]:
-        prob_model = ProbabilisticMoE(base_model, num_samples=config['mc_dropout_samples'])
-        print("Generating MC Dropout predictions...")
-        # Predict on numpy array for simplicity with the wrapper
-        mc_samples_scaled = prob_model.predict(X_test, batch_size=config['batch_size'])
-        # Output shape: (num_samples, num_points, 1) -> Squeeze last dim
-        mc_samples_scaled = tf.squeeze(mc_samples_scaled, axis=-1).numpy() # (num_samples, num_points)
-
-        y_pred_mean_scaled = np.mean(mc_samples_scaled, axis=0) # (num_points,)
-        y_pred_std_scaled = np.std(mc_samples_scaled, axis=0) # (num_points,)
-
-        y_pred_mean = scaler_target.inverse_transform(y_pred_mean_scaled.reshape(-1, 1).astype(np.float32))
-        y_pred_std = y_pred_std_scaled * (scaler_target.data_max_[0] - scaler_target.data_min_[0])
-        print("MC Dropout finished.")
-    else:
-        print("Generating standard predictions...")
-        y_pred_mean_scaled = base_model.predict(X_test, batch_size=config['batch_size'])
-        y_pred_mean = scaler_target.inverse_transform(y_pred_mean_scaled.astype(np.float32))
-        y_pred_std = None
-
-    mae_unscaled = np.mean(np.abs(y_pred_mean - y_test_unscaled))
-    print(f"Test MAE (Unscaled Price): {mae_unscaled:.4f} (Scaled MAE: {test_mae_scaled:.6f})")
+    print("Generating MC Dropout predictions...")
+    mc_predictions = []
+    for _ in range(50):  # Number of MC samples
+        pred = base_model.predict(X_test, verbose=0)
+        if isinstance(pred, dict):
+            mc_predictions.append(pred['mean'].flatten())
+        else:
+            mc_predictions.append(pred.flatten())
+    
+    mc_predictions = np.stack(mc_predictions, axis=0)
+    mean_prediction = np.mean(mc_predictions, axis=0)
+    variance = np.var(mc_predictions, axis=0)
+    
+    # Calculate confidence intervals (95% confidence)
+    z_score = 1.96  # For 95% confidence
+    confidence_interval = z_score * np.sqrt(variance)
+    
+    # Save predictions and uncertainty estimates
+    np.save('prediction_results.npy', {
+        'true_values': y_test,
+        'predictions': mean_prediction,
+        'uncertainty': variance,
+        'confidence_intervals': confidence_interval
+    })
+    
+    # Plot results
+    plt.figure(figsize=(12, 6))
+    plt.plot(y_test, label='True Values', color='blue', alpha=0.5)
+    plt.plot(mean_prediction, label='Predictions', color='red', alpha=0.5)
+    plt.fill_between(
+        range(len(mean_prediction)),
+        mean_prediction - confidence_interval.flatten(),
+        mean_prediction + confidence_interval.flatten(),
+        color='red',
+        alpha=0.2,
+        label='95% Confidence Interval'
+    )
+    plt.title('Stock Price Predictions with Uncertainty')
+    plt.xlabel('Time')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.savefig('predictions.png')
+    plt.close()
+    
+    print("Predictions and uncertainty estimates saved to 'prediction_results.npy'")
+    print("Visualization saved to 'predictions.png'")
 
     if config["calculate_financial_metrics"]:
-         _ = calculate_financial_metrics(y_test_unscaled.flatten(), y_pred_mean.flatten())
+         _ = calculate_financial_metrics(y_test.flatten(), mean_prediction.flatten())
 
     print("\n--- 7. Plotting Results ---")
     plot_training_history(history, config)
-    plot_predictions(y_test_unscaled, y_pred_mean, y_pred_std, config, target_col_name)
+    plot_predictions(y_test, mean_prediction, variance, config, target_col_name)
 
     # 8. Optional: Export to ONNX
     if config.get("onnx_export_path"):

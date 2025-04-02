@@ -6,6 +6,9 @@ from sklearn.preprocessing import MinMaxScaler
 import joblib # For loading scalers
 import os
 
+# Enable unsafe deserialization for Lambda layers
+tf.keras.config.enable_unsafe_deserialization()
+
 # Import project modules
 from config.config import CONFIG # Use config for defaults like seq length
 from moe_model.components import TransformerExpert # Need custom layer for loading
@@ -15,6 +18,13 @@ from moe_model.data_loader import load_and_prepare_data # Simplified use
 from moe_model.feature_engineering import apply_feature_engineering
 from moe_model.preprocessing import scale_and_sequence_data # Only need sequence part
 
+# Add imports for the Lambda functions
+from moe_model.model_builder import (
+    reshape_expert_outputs,
+    reshape_gate_outputs,
+    sum_weighted_outputs
+)
+
 def load_model_for_prediction(config):
     """Loads the trained Keras model."""
     checkpoint_path = os.path.join(config["checkpoint_dir"], config["checkpoint_filename"])
@@ -22,9 +32,14 @@ def load_model_for_prediction(config):
         raise FileNotFoundError(f"Trained model not found at {checkpoint_path}")
 
     print(f"Loading model from: {checkpoint_path}")
-    custom_objects = {'TransformerExpert': TransformerExpert} # Add others if used
+    # Update custom_objects to include Lambda functions
+    custom_objects = {
+        'TransformerExpert': TransformerExpert,
+        'moe_model>reshape_expert_outputs': reshape_expert_outputs,
+        'moe_model>reshape_gate_outputs': reshape_gate_outputs,
+        'moe_model>sum_weighted_outputs': sum_weighted_outputs
+    }
     try:
-        # Load without compiling initially if loss/optimizer state isn't needed for prediction
         model = tf.keras.models.load_model(checkpoint_path, custom_objects=custom_objects, compile=False)
         print("Model loaded successfully.")
         return model
@@ -108,11 +123,15 @@ if __name__ == "__main__":
 
     # 3. Make Prediction
     if CONFIG.get("predict_uncertainty", False):
-        print(f"Performing MC Dropout prediction ({CONFIG['mc_dropout_samples']} samples)...")
-        prob_model = ProbabilisticMoE(trained_base_model, num_samples=CONFIG['mc_dropout_samples'])
-        mc_samples_scaled = prob_model.predict(input_sequence) # Shape (num_samples, 1, 1)
-        mc_samples_scaled = tf.squeeze(mc_samples_scaled).numpy() # (num_samples,)
-
+        print("Performing MC Dropout prediction (50 samples)...")
+        mc_samples_scaled = []
+        for _ in range(50):
+            pred = trained_base_model(input_sequence, training=True)
+            if hasattr(pred, 'numpy'):
+                mc_samples_scaled.append(pred.numpy())
+            else:
+                mc_samples_scaled.append(pred)
+        mc_samples_scaled = np.array(mc_samples_scaled)
         pred_mean_scaled = np.mean(mc_samples_scaled)
         pred_std_scaled = np.std(mc_samples_scaled)
 
@@ -127,7 +146,7 @@ if __name__ == "__main__":
 
     else:
         print("Performing standard prediction...")
-        prediction_scaled = trained_base_model.predict(input_sequence) # Shape (1, 1)
+        prediction_scaled = trained_base_model(input_sequence) # Shape (1, 1)
         prediction_unscaled = scaler_target.inverse_transform(prediction_scaled)[0, 0]
         print(f"\nPrediction for next step ({target_name}): {prediction_unscaled:.4f}")
 

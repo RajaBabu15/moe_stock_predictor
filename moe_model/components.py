@@ -146,43 +146,50 @@ def context_aware_gating(inputs, config, name="context_aware_gating"):
 
 def attention_mha_gating(inputs, config, name="attention_mha_gating"):
     """Gating based on BiLSTM + MultiHeadAttention Model."""
-    gate_cfg = config['gating_config']; num_experts = config['num_experts']
-    l2_reg_val = config.get("l2_reg", 0.0); l2_reg = regularizers.l2(l2_reg_val) if l2_reg_val > 0 else None
+    gate_cfg = config['gating_config']
+    num_experts = config['num_experts']
+    l2_reg_val = config.get("l2_reg", 0.0)
+    l2_reg = regularizers.l2(l2_reg_val) if l2_reg_val > 0 else None
     dropout = gate_cfg.get("dropout", 0.2)
     lstm_units = gate_cfg.get("lstm_units", [32])[0]
     num_heads = gate_cfg.get("mha_heads", 4)
     key_dim = gate_cfg.get("mha_key_dim", 32)
     use_bidirectional = gate_cfg.get("use_bidirectional", True)
     mixed_precision = config.get("use_mixed_precision", False)
-    x = inputs
 
+    # Create model
+    input_layer = Input(shape=inputs.shape[1:], name=f"{name}_input")
+    x = input_layer
+
+    # LSTM layer
     rnn_layer = LSTM(lstm_units, return_sequences=True, kernel_regularizer=l2_reg)
-    x = Bidirectional(rnn_layer) if use_bidirectional else rnn_layer(x)
+    if use_bidirectional:
+        x = Bidirectional(rnn_layer)(x)
+    else:
+        x = rnn_layer(x)
     x = Dropout(dropout)(x)
+
     # Ensure key_dim compatibility
     effective_dim = lstm_units * 2 if use_bidirectional else lstm_units
     if key_dim * num_heads != effective_dim:
         print(f"Warning: MHA input dim ({effective_dim}) != heads*key_dim ({num_heads}*{key_dim}). Adjusting key_dim.")
-        # Adjust key_dim or add a projection layer before MHA
-        # Simple approach: Project MHA input to compatible dimension or adjust key_dim
-        # x = Dense(num_heads * key_dim, activation='relu')(x) # Optional projection
-        # Or adjust key_dim if possible:
         if effective_dim % num_heads == 0:
-             key_dim = effective_dim // num_heads
-             print(f"Adjusted key_dim to {key_dim}")
+            key_dim = effective_dim // num_heads
+            print(f"Adjusted key_dim to {key_dim}")
         else:
-             # Fallback or raise error if projection is not desired
-             print(f"Cannot adjust key_dim easily. MHA might be suboptimal.")
+            x = Dense(num_heads * key_dim, activation='relu')(x)  # Project to compatible dimension
 
-
+    # Multi-head attention
     attn_output = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim, dropout=dropout)(query=x, value=x, key=x)
     x = GlobalAveragePooling1D()(attn_output)
     gate_logits = Dense(num_experts, name="gate_logits", kernel_regularizer=l2_reg)(x)
     gate_outputs = Softmax(name="gate_softmax_outputs")(gate_logits)
+
     if mixed_precision:
         gate_outputs = tf.keras.layers.Activation('softmax', dtype='float32', name='gate_output_float32')(gate_logits)
         gate_logits = tf.cast(gate_logits, dtype='float32')
-    return Model(inputs=inputs, outputs=[gate_outputs, gate_logits], name=name)
+
+    return Model(inputs=input_layer, outputs=[gate_outputs, gate_logits], name=name)
 
 
 # Placeholder for CrossAttention Gating - needs careful thought on how to integrate
@@ -191,30 +198,45 @@ def attention_mha_gating(inputs, config, name="attention_mha_gating"):
 
 # === Loss Functions ===
 
-def load_balancing_loss(gate_logits, num_experts, eps=1e-10):
-    """CV^2 Load Balancing Loss."""
-    # Ensure float32 for softmax stability, esp. with mixed precision
-    gate_logits = tf.cast(gate_logits, tf.float32)
-    p = tf.nn.softmax(gate_logits, axis=-1)
-    importance = tf.reduce_mean(p, axis=0) # mean across batch
-    mean_importance = tf.constant(1.0 / num_experts, dtype=tf.float32)
-    # Simplified calculation for numerical stability
-    # Calculate sum(p_i^2) and sum(p_i) per expert across batch
-    sum_sq_p = tf.reduce_sum(tf.square(p), axis=0) # Sum of squares for each expert
-    sum_p = tf.reduce_sum(p, axis=0) # Sum for each expert
+class LoadBalancingLossLayer(tf.keras.layers.Layer):
+    def __init__(self, num_experts, **kwargs):
+        super(LoadBalancingLossLayer, self).__init__(**kwargs)
+        self.num_experts = num_experts
 
-    # Calculate variance of the *fraction* of batch assigned to each expert
-    # f_i = mean(p_i across batch) = sum(p_i) / batch_size
-    batch_size = tf.cast(tf.shape(p)[0], tf.float32)
-    f_i = sum_p / batch_size
-    variance_f = tf.reduce_mean(tf.square(f_i)) - tf.square(mean_importance)
+    def call(self, gate_logits):
+        # Cast inputs to float32
+        gate_logits = tf.cast(gate_logits, tf.float32)
+        
+        # Calculate softmax of gate logits
+        gates = tf.nn.softmax(gate_logits, axis=-1)
+        
+        # Calculate the fraction of tokens routed to each expert
+        # Shape: [num_experts]
+        router_prob = tf.reduce_mean(gates, axis=0)
+        
+        # Calculate the auxiliary load balancing loss
+        # We want a uniform distribution of 1/num_experts for each expert
+        uniform_prob = tf.ones_like(router_prob) / tf.cast(self.num_experts, tf.float32)
+        aux_loss = tf.reduce_sum(router_prob * tf.math.log(router_prob / uniform_prob))
+        
+        # Add the auxiliary loss to the model's losses
+        self.add_loss(aux_loss)
+        
+        return aux_loss
 
-    # CV^2 = variance / mean^2
-    cv_squared = variance_f / (tf.square(mean_importance) + eps)
-
-    # Loss is often scaled by num_experts^2
-    loss = tf.cast(num_experts * num_experts, tf.float32) * cv_squared
-    return loss
+def load_balancing_loss(gate_logits, num_experts):
+    """
+    Compute load balancing loss for mixture of experts gating.
+    Now returns a Keras Layer that can be used in the model.
+    
+    Args:
+        gate_logits: Tensor of shape [batch_size, num_experts] containing gate logits
+        num_experts: Number of experts in the mixture
+    
+    Returns:
+        A LoadBalancingLossLayer instance
+    """
+    return LoadBalancingLossLayer(num_experts)(gate_logits)
 
 
 def directional_loss(y_true, y_pred, weight=0.1):
@@ -249,3 +271,30 @@ def directional_loss(y_true, y_pred, weight=0.1):
 
 
     return mse_loss + direction_penalty * weight
+
+class GateWeightLogger(tf.keras.callbacks.Callback):
+    """Callback to log gate weights during training."""
+    def __init__(self, log_dir='logs/gate_weights', log_freq=5):
+        super().__init__()
+        self.log_dir = log_dir
+        self.log_freq = log_freq
+        self.writer = tf.summary.create_file_writer(log_dir)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.log_freq == 0:
+            # Get the gate weights from the model
+            gate_layer = None
+            for layer in self.model.layers:
+                if 'gate_softmax_outputs' in layer.name:
+                    gate_layer = layer
+                    break
+            
+            if gate_layer is not None:
+                with self.writer.as_default():
+                    # Log the gate weights distribution
+                    tf.summary.histogram('gate_weights', gate_layer.weights[0], step=epoch)
+                    self.writer.flush()
+
+    def on_train_end(self, logs=None):
+        if hasattr(self, 'writer'):
+            self.writer.close()

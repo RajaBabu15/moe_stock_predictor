@@ -1,4 +1,5 @@
 # app.py
+import datetime
 import gradio as gr
 import pandas as pd
 import numpy as np
@@ -13,54 +14,71 @@ from moe_model.uncertainty import ProbabilisticMoE
 # Need simplified versions or reuse parts of data pipeline for Gradio input
 from moe_model.feature_engineering import apply_feature_engineering # Simplified use
 from moe_model.preprocessing import scale_and_sequence_data # Simplified use
+from moe_model.model_builder import reshape_expert_outputs, reshape_gate_outputs, sum_weighted_outputs
 
 # --- Global Variables (Load Model and Scalers once) ---
 MODEL = None
 SCALER_FEATURES = None
 SCALER_TARGET = None
-TARGET_COL_NAME = CONFIG["target_column"] # Assume config is correct
+TARGET_COL_NAME = CONFIG.get("target_column", "Close")  # Default to 'Close' if not in config
 FEATURE_COLS = None # Determined after loading data first time
 
 def load_resources():
     """Loads model and scalers."""
     global MODEL, SCALER_FEATURES, SCALER_TARGET, FEATURE_COLS, TARGET_COL_NAME
 
-    if MODEL is not None: # Avoid reloading
+    if MODEL is not None:
         return True
 
-    # Load Model
+    # Load Model with custom objects for Lambda layers
     checkpoint_path = os.path.join(CONFIG["checkpoint_dir"], CONFIG["checkpoint_filename"])
     if not os.path.exists(checkpoint_path):
         print(f"ERROR: Model checkpoint not found at {checkpoint_path}")
         return False
     try:
-        custom_objects = {'TransformerExpert': TransformerExpert}
-        MODEL = tf.keras.models.load_model(checkpoint_path, custom_objects=custom_objects, compile=False)
-        print("Model loaded for Gradio app.")
+        custom_objects = {
+            'TransformerExpert': TransformerExpert,
+            'reshape_expert_outputs': reshape_expert_outputs,
+            'reshape_gate_outputs': reshape_gate_outputs,
+            'sum_weighted_outputs': sum_weighted_outputs
+        }
+        MODEL = tf.keras.models.load_model(checkpoint_path, custom_objects=custom_objects)
+        print("Model loaded successfully for Gradio app.")
     except Exception as e:
         print(f"ERROR: Failed to load model: {e}")
-        return False
+        # Try loading from hyperparameter tuning results
+        tuned_model_path = os.path.join("hyperparam_tuning", "moe_stock_hyper_tuning", "best_moe_model_tuned.keras")
+        if os.path.exists(tuned_model_path):
+            try:
+                MODEL = tf.keras.models.load_model(tuned_model_path, custom_objects=custom_objects)
+                print("Successfully loaded tuned model instead.")
+            except Exception as e2:
+                print(f"ERROR: Also failed to load tuned model: {e2}")
+                return False
+        else:
+            return False
 
-    # Load Scalers (Requires saving them during training)
+    # Load Scalers
     scaler_features_path = 'scaler_features.joblib'
     scaler_target_path = 'scaler_target.joblib'
     if os.path.exists(scaler_features_path) and os.path.exists(scaler_target_path):
         SCALER_FEATURES = joblib.load(scaler_features_path)
         SCALER_TARGET = joblib.load(scaler_target_path)
-        # Determine feature columns from scaler
         if hasattr(SCALER_FEATURES, 'feature_names_in_'):
-             FEATURE_COLS = SCALER_FEATURES.feature_names_in_
-        else: # Fallback - try to infer (less reliable)
-             print("Warning: Could not get feature names from scaler. Prediction might fail.")
-        print("Scalers loaded.")
+            FEATURE_COLS = SCALER_FEATURES.feature_names_in_
+        else:
+            print("Warning: Could not get feature names from scaler.")
+        print("Scalers loaded successfully.")
         return True
     else:
-        print(f"ERROR: Scaler files ({scaler_features_path}, {scaler_target_path}) not found. Please train the model and save scalers.")
+        print(f"ERROR: Scaler files not found.")
         return False
 
 
 def predict_stock(input_df):
     """Takes DataFrame input, preprocesses, predicts, and returns prediction."""
+    global TARGET_COL_NAME  # Add global declaration
+    
     if not load_resources():
         return "Error: Model or Scalers not loaded.", None
 
@@ -83,23 +101,55 @@ def predict_stock(input_df):
         input_df['Date'] = pd.to_datetime(input_df['Date'])
         input_df = input_df.set_index('Date')
 
-        # Ensure target column exists for feature engineering steps if needed
+        # Ensure target column exists and set it if needed
         if TARGET_COL_NAME not in input_df.columns:
-             if 'Close' in input_df.columns: TARGET_COL_NAME = 'Close'
-             else: return "Error: Target column ('Close' or configured) missing.", None
+            if 'Close' in input_df.columns:
+                TARGET_COL_NAME = 'Close'
+            else:
+                return "Error: Target column ('Close' or configured) missing.", None
 
-        df_featured = apply_feature_engineering(input_df, CONFIG)
+        # Get the exact feature columns from the scaler
+        if FEATURE_COLS is None:
+            return "Error: Feature columns not loaded from scaler. Please restart the app.", None
 
-        # Get features matching the scaler
-        if FEATURE_COLS is None: # If feature names weren't loaded
-             current_feature_cols = [col for col in df_featured.columns if col not in [TARGET_COL_NAME, 'Target']] # Recalculate
-        else:
-             current_feature_cols = [col for col in FEATURE_COLS if col in df_featured.columns] # Use known feature names
+        # Create a copy of the input data to avoid modifying the original
+        df_featured = input_df.copy()
+        
+        # Apply feature engineering with the same configuration as training
+        df_featured = apply_feature_engineering(df_featured, CONFIG)
+        
+        # Ensure all required features are present
+        missing_features = [col for col in FEATURE_COLS if col not in df_featured.columns]
+        if missing_features:
+            # Try to add missing features with default values
+            for feature in missing_features:
+                if feature.startswith('trend_psar'):
+                    # Add PSAR features with default values
+                    df_featured[feature] = 0.0
+                elif feature.startswith('momentum_'):
+                    # Add momentum features with default values
+                    df_featured[feature] = 0.0
+                elif feature.startswith('volume_'):
+                    # Add volume features with default values
+                    df_featured[feature] = 0.0
+                elif feature.startswith('volatility_'):
+                    # Add volatility features with default values
+                    df_featured[feature] = 0.0
+                elif feature.startswith('trend_'):
+                    # Add trend features with default values
+                    df_featured[feature] = 0.0
+                else:
+                    # For other missing features, add with 0
+                    df_featured[feature] = 0.0
+            print(f"Added missing features with default values: {missing_features}")
 
-        if not current_feature_cols: return "Error: No matching feature columns found after processing.", None
-
-        # Keep only the required feature columns
-        df_final_features = df_featured[current_feature_cols]
+        # Ensure all required columns are present and in the correct order
+        df_final_features = pd.DataFrame(index=df_featured.index)
+        for col in FEATURE_COLS:
+            if col in df_featured.columns:
+                df_final_features[col] = df_featured[col]
+            else:
+                df_final_features[col] = 0.0
 
         scaled_features = SCALER_FEATURES.transform(df_final_features)
         last_sequence_scaled = scaled_features[-CONFIG["sequence_length"]:]
@@ -113,15 +163,27 @@ def predict_stock(input_df):
         if CONFIG.get("predict_uncertainty", False):
             prob_model = ProbabilisticMoE(MODEL, num_samples=CONFIG['mc_dropout_samples'])
             mc_samples_scaled = prob_model.predict(input_sequence)
-            mc_samples_scaled = tf.squeeze(mc_samples_scaled).numpy()
-            pred_mean_scaled = np.mean(mc_samples_scaled)
-            pred_std_scaled = np.std(mc_samples_scaled)
+            
+            # Handle dictionary output from probabilistic model
+            if isinstance(mc_samples_scaled, dict):
+                pred_mean_scaled = mc_samples_scaled['mean'].numpy()[0]
+                pred_std_scaled = np.sqrt(mc_samples_scaled['variance'].numpy()[0])
+            else:
+                mc_samples_scaled = tf.squeeze(mc_samples_scaled).numpy()
+                pred_mean_scaled = np.mean(mc_samples_scaled)
+                pred_std_scaled = np.std(mc_samples_scaled)
+            
             pred_mean = SCALER_TARGET.inverse_transform([[pred_mean_scaled]])[0, 0]
             pred_std = pred_std_scaled * (SCALER_TARGET.data_max_[0] - SCALER_TARGET.data_min_[0])
             result_text = f"Predicted Price: {pred_mean:.2f} (+/- {1.96 * pred_std:.2f} 95% CI)"
         else:
             prediction_scaled = MODEL.predict(input_sequence)
-            pred_mean = SCALER_TARGET.inverse_transform(prediction_scaled)[0, 0]
+            # Handle dictionary output from regular model
+            if isinstance(prediction_scaled, dict):
+                pred_mean_scaled = prediction_scaled['mean'].numpy()[0]
+            else:
+                pred_mean_scaled = prediction_scaled[0, 0]
+            pred_mean = SCALER_TARGET.inverse_transform([[pred_mean_scaled]])[0, 0]
             result_text = f"Predicted Price: {pred_mean:.2f}"
 
         # Create a simple plot dataframe (e.g., last N actual + prediction)
