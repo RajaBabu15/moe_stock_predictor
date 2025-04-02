@@ -1,0 +1,7 @@
+Mixture-of-Experts Stock Price Predictor
+github.com/RajaBabu15/moe_stock_predictor
+Feb 2024 – Apr 2024
+• Developed an advanced deep learning model using TensorFlow/Keras that combines multiple specialized neural networks (Transformer, LSTM) with dynamic routing mechanisms for enhanced stock price prediction accuracy.
+• Implemented Monte Carlo Dropout for uncertainty estimation and confidence intervals, providing probabilistic forecasts with 95% confidence bands for risk-aware trading decisions.
+• Engineered a comprehensive feature engineering pipeline incorporating technical indicators, volatility measures, and sequence-based preprocessing to capture complex market dynamics.
+• Technologies: Python, TensorFlow/Keras, Pandas, NumPy, Gradio, ONNX, TA-Lib
